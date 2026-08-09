@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+client_secret*.json
+credentials.json
+token*.json
+__pycache__/
+*.py[cod]
+frontend/node_modules/
+frontend/dist/

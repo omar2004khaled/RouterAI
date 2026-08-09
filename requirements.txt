@@ -23,3 +23,10 @@ ctranslate2>=4.0.0
 
 # LLM fallback reasoning (optional — pipeline works without an API key)
 google-generativeai==0.8.5
+
+# API adapter for the React frontend
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+google-auth-oauthlib==1.2.1
+google-api-python-client==2.169.0
+python-dotenv==1.1.0

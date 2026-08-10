@@ -1,7 +1,5 @@
 # RouterAI — Notification Intelligence System
 
-HackerRank Orchestrate · August 2026 · Omar Khaled Hussein
-
 ---
 
 ## What It Does

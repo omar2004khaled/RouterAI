@@ -12,9 +12,10 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
+import sentry_sdk
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +32,19 @@ if os.getenv("OAUTHLIB_RELAX_TOKEN_SCOPE"):
     os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# ── Sentry initialisation ────────────────────────────────────────────────────
+# DSN is read from the SENTRY_DSN environment variable.
+# If the variable is not set, Sentry is silently disabled — the app still works.
+_sentry_dsn = os.getenv("SENTRY_DSN", "")
+if _sentry_dsn:
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        # Capture 100 % of transactions in development; lower this in production.
+        traces_sample_rate=1.0,
+        # Attach the request body to error events so you can see what was sent.
+        send_default_pii=False,
+    )
 
 from confidence import ConfidenceCalibrator
 from context_builder import ContextBuilder
@@ -129,6 +143,7 @@ class RouterService:
 
 
 service: RouterService | None = None
+_startup_time: float = time.time()
 # Development-only in-memory storage. In production replace this with encrypted,
 # persistent server-side storage (and use a strong SESSION_SECRET).
 gmail_sessions: dict[str, object] = {}
@@ -141,7 +156,26 @@ async def lifespan(_: FastAPI):
     yield
     service = None
 
-app = FastAPI(title="WhatsApp Notification Router API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="RouterAI — WhatsApp Notification Router API",
+    version="1.0.0",
+    description=(
+        "AI-powered pipeline that classifies every incoming WhatsApp message "
+        "into **notify**, **digest**, or **mute**.\n\n"
+        "The pipeline runs: ContextBuilder → FeatureExtractor → EvidenceRetriever "
+        "→ RuleEngine (90 rules) → ReasoningEngine (Gemini / heuristic) → ConfidenceCalibrator.\n\n"
+        "A Gmail intelligence mode is also available via OAuth 2.0 (read-only)."
+    ),
+    contact={"name": "Omar Khaled Hussein"},
+    lifespan=lifespan,
+    openapi_tags=[
+        {"name": "routing",  "description": "Core message routing — analyze a message or browse dataset decisions."},
+        {"name": "dashboard","description": "Aggregate statistics and trend data for the dashboard UI."},
+        {"name": "gmail",    "description": "Gmail OAuth 2.0 connection and inbox analysis."},
+        {"name": "system",   "description": "Health checks and system status."},
+        {"name": "debug",    "description": "Development-only endpoints. Disabled in production."},
+    ],
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -163,16 +197,99 @@ def router() -> RouterService:
         raise HTTPException(503, "Router is still initializing")
     return service
 
-@app.get("/api/messages")
+# ---------------------------------------------------------------------------
+# System / health
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/health",
+    tags=["system"],
+    summary="Health check",
+    description="Returns pipeline readiness, uptime in seconds, and version. "
+                "Deployment platforms use this endpoint to verify the service is alive.",
+)
+def health_check() -> dict:
+    return {
+        "status": "ok",
+        "pipeline_ready": service is not None,
+        "uptime_seconds": round(time.time() - _startup_time, 1),
+        "version": "1.0.0",
+    }
+
+@app.get(
+    "/api/system",
+    tags=["system"],
+    summary="System status",
+    description="High-level system status string used by the frontend status bar.",
+)
+def get_system() -> dict:
+    return {"status": "Operational", "version": "1.0.0", "backend": "FastAPI connected to Python router", "latency": "Live"}
+
+# ---------------------------------------------------------------------------
+# Debug (development only — disabled when DEBUG_MODE != true)
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/debug/sentry-test",
+    tags=["debug"],
+    summary="Trigger a test Sentry error",
+    description="Raises a deliberate ZeroDivisionError so you can verify Sentry "
+                "is receiving events. **Only active when `DEBUG_MODE=true` in the "
+                "environment.** Returns 404 in production.",
+)
+def sentry_test() -> dict:
+    if os.getenv("DEBUG_MODE", "false").lower() != "true":
+        raise HTTPException(404, "Not found")
+    # This intentional error will be captured by Sentry.
+    result = 1 / 0  # noqa: F841  — deliberate ZeroDivisionError
+    return {"ok": True}  # never reached
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/messages",
+    tags=["routing"],
+    summary="List all routed messages",
+    description="Returns all 110 messages from the dataset with their routing decisions "
+                "(action, confidence, timestamp). Sorted newest-first.",
+)
 def get_messages() -> list[dict]: return router().message_rows()
 
-@app.get("/api/dashboard")
+@app.post(
+    "/api/analyze",
+    tags=["routing"],
+    summary="Route a single message",
+    description="Runs the full 7-stage pipeline on the supplied message text and returns "
+                "the routing decision with action, confidence, message type, reasoning, "
+                "and supporting evidence IDs.",
+)
+def analyze_message(request: AnalyzeRequest) -> dict: return router().analyze(request)
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/dashboard",
+    tags=["dashboard"],
+    summary="Dataset routing summary",
+    description="Aggregate counts of notify / digest / mute decisions across the 110-message dataset, "
+                "plus average confidence score.",
+)
 def get_dashboard() -> dict:
     rows = router().message_rows()
     total = len(rows)
     return {"total": total, "notify": sum(x["action"] == "NOTIFY" for x in rows), "digest": sum(x["action"] == "DIGEST" for x in rows), "mute": sum(x["action"] == "MUTE" for x in rows), "confidence": round(sum(x["confidence"] for x in rows) / total, 2) if total else 0, "processingTime": None}
 
-@app.get("/api/dashboard/gmail")
+@app.get(
+    "/api/dashboard/gmail",
+    tags=["dashboard"],
+    summary="Gmail analysis summary",
+    description="Aggregate routing stats for the currently connected Gmail inbox. "
+                "Returns `connected: false` if no Gmail session is active.",
+)
 def get_dashboard_gmail(request: Request) -> dict:
     key = request.session.get("gmail_session")
     session = gmail_sessions.get(key) if key else None
@@ -189,15 +306,14 @@ def get_dashboard_gmail(request: Request) -> dict:
             "mute": sum(1 for r in results if r.get("action", "").upper() == "MUTE"),
             "confidence": confidence, "analyzed": True}
 
-@app.get("/api/analytics")
+@app.get(
+    "/api/analytics",
+    tags=["dashboard"],
+    summary="Routing trend data",
+    description="Returns daily routing counts (notify / digest / mute) for the trend chart "
+                "and a pie-chart breakdown by action.",
+)
 def get_analytics() -> dict: return router().analytics()
-
-@app.get("/api/system")
-def get_system() -> dict:
-    return {"status": "Operational", "version": "1.0.0", "backend": "FastAPI connected to Python router", "latency": "Live"}
-
-@app.post("/api/analyze")
-def analyze_message(request: AnalyzeRequest) -> dict: return router().analyze(request)
 
 def _session_id(request: Request) -> str:
     key = request.session.get("gmail_session")
@@ -205,13 +321,25 @@ def _session_id(request: Request) -> str:
         raise HTTPException(401, "Gmail is not connected. Connect Gmail before requesting inbox data.")
     return key
 
-@app.get("/api/auth/gmail")
+@app.get(
+    "/api/auth/gmail",
+    tags=["gmail"],
+    summary="Start Gmail OAuth flow",
+    description="Redirects the browser to Google's OAuth consent screen. "
+                "After the user grants access, Google redirects back to `/api/auth/gmail/callback`.",
+)
 def gmail_auth(request: Request):
     url, state = authorization_url()
     request.session["gmail_oauth_state"] = state
     return RedirectResponse(url)
 
-@app.get("/api/auth/gmail/callback")
+@app.get(
+    "/api/auth/gmail/callback",
+    tags=["gmail"],
+    summary="Gmail OAuth callback",
+    description="Handles the redirect from Google after the user grants or denies access. "
+                "On success, stores credentials in the server session and redirects to the frontend.",
+)
 def gmail_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
     import traceback
     frontend = os.getenv("FRONTEND_URL", "http://localhost:5173")
@@ -230,20 +358,38 @@ def gmail_callback(request: Request, code: str | None = None, state: str | None 
     request.session["gmail_session"] = key
     return RedirectResponse(f"{frontend}?gmail=connected")
 
-@app.get("/api/gmail/status")
+@app.get(
+    "/api/gmail/status",
+    tags=["gmail"],
+    summary="Gmail connection status",
+    description="Returns whether a Gmail account is currently connected in this session, "
+                "and the connected email address if so.",
+)
 def gmail_status(request: Request) -> dict:
     key = request.session.get("gmail_session")
     session = gmail_sessions.get(key) if key else None
     return {"connected": bool(session), **({"email": session["email"]} if session else {})}
 
-@app.delete("/api/gmail/connection")
+@app.delete(
+    "/api/gmail/connection",
+    tags=["gmail"],
+    summary="Disconnect Gmail",
+    description="Clears the Gmail session and all cached analysis results. "
+                "Does not modify, delete, or send any Gmail messages.",
+)
 def gmail_disconnect(request: Request) -> dict:
     key = request.session.pop("gmail_session", None)
     if key:
         gmail_sessions.pop(key, None); gmail_results.pop(key, None)
     return {"disconnected": True, "message": "Gmail disconnected. Your Gmail messages were not modified."}
 
-@app.get("/api/gmail/messages")
+@app.get(
+    "/api/gmail/messages",
+    tags=["gmail"],
+    summary="Fetch Gmail inbox",
+    description="Returns up to `limit` emails from the connected Gmail inbox. "
+                "Supports pagination via `page_token` and Gmail search syntax via `query`.",
+)
 def gmail_messages(request: Request, limit: int = 25, page_token: str | None = None, query: str | None = None) -> dict:
     key = _session_id(request)
     try:
@@ -252,7 +398,14 @@ def gmail_messages(request: Request, limit: int = 25, page_token: str | None = N
     except HTTPException: raise
     except Exception as exc: raise HTTPException(502, "Unable to read Gmail messages. Reconnect Gmail and try again.") from exc
 
-@app.post("/api/gmail/analyze")
+@app.post(
+    "/api/gmail/analyze",
+    tags=["gmail"],
+    summary="Analyze Gmail inbox",
+    description="Fetches up to `limit` emails and runs the full RouterAI pipeline on each one "
+                "using a synthetic context built from sender domain, Gmail labels, and feedback history. "
+                "Results are cached in the session for the dashboard.",
+)
 def gmail_analyze(request: Request, limit: int = 25, query: str | None = None) -> dict:
     key = _session_id(request)
     try: emails, _ = fetch_messages(gmail_sessions[key]["credentials"], limit, None, query)
@@ -530,7 +683,12 @@ def _analyze_email(email, feedback: dict[str, str]) -> dict:
     }
 
 
-@app.get("/api/gmail/results")
+@app.get(
+    "/api/gmail/results",
+    tags=["gmail"],
+    summary="Get cached Gmail analysis results",
+    description="Returns the results from the most recent `/api/gmail/analyze` call for this session.",
+)
 def gmail_saved_results(request: Request) -> dict:
     return {"results": gmail_results.get(_session_id(request), [])}
 
@@ -541,7 +699,13 @@ class FeedbackRequest(BaseModel):
     subject: str = ""
     sender: str = ""
 
-@app.post("/api/gmail/feedback")
+@app.post(
+    "/api/gmail/feedback",
+    tags=["gmail"],
+    summary="Submit a routing correction",
+    description="Saves a user correction to `dataset/feedback.csv`. "
+                "On the next analysis run, corrections for this sender are applied automatically at 0.95 confidence.",
+)
 def gmail_feedback(body: FeedbackRequest, request: Request) -> dict:
     _session_id(request)
     feedback_path = ROOT / "dataset" / "feedback.csv"
@@ -555,7 +719,12 @@ def gmail_feedback(body: FeedbackRequest, request: Request) -> dict:
                          "timestamp": datetime.now().isoformat()})
     return {"saved": True}
 
-@app.get("/api/gmail/feedback")
+@app.get(
+    "/api/gmail/feedback",
+    tags=["gmail"],
+    summary="Get all saved feedback",
+    description="Returns all routing corrections previously saved to `dataset/feedback.csv`.",
+)
 def gmail_get_feedback(request: Request) -> dict:
     _session_id(request)
     feedback_path = ROOT / "dataset" / "feedback.csv"
